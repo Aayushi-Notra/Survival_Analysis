@@ -1,0 +1,253 @@
+---
+title: "Survival_Analysis"
+author: "Aayushi"
+date: '2024-05-01'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document with survival analysis performed on TCGA data 
+
+Survival analysis is a statistical method to understand how long it takes for an event to occur
+Survival analysis analyzes the rate of occurrence of an event over time.
+
+In cancer studies we can perform this analysis to answer questions like: 
+What is the probabilty of surviavl x years after diagnosis?
+What factors(mutations, gene expression, age etc) influence lifespan of patient with disease?
+Difference between survival of two groups (with treatment A vs treatment B)
+Identify factors contributing to differences in survival between different subtypes of cancer 
+
+Methods for survival analysis:
+Kaplan-Meier plots
+Log-rank test
+Cox proportion hazard regression
+
+
+Survival analysis requires 3 types of information: 
+1) Time to event
+
+2) Status (Censoring): 
+Censoring is a type of missing data problem. Observations for which the information is incomplete are censored.
+
+The event may not be observed in some individuals due to (a)drop outs (b)Loss of follow up (C)survived beyond time(event of interest did not occur)
+
+Right censoring - Patients for which the event did not occur or the ones for which follow up was lost. This is given by ticks on the survival plot 
+
+3) Event: in medical research it could be:
+          (a) Death 
+          (b)Progression of disease 
+          (c)Relapse in case of cancer
+          (d)Development of secondary malignancy 
+          (e)Hospitalization 
+
+```{r cars}
+#importing the required packages 
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("TCGAbiolinks")
+```
+
+```{r }
+install.packages("survminer")
+```
+```{r}
+install.packages("survival")
+BiocManager::install("DESeq2")
+```
+
+```{r}
+#Loading the required packages 
+library(tidyverse)
+library(dplyr)
+library(survival)
+library(survminer)
+library(TCGAbiolinks)
+library(DESeq2)
+```
+
+As an example dataset I will download data from the GDC portal. BUt first lets have a look at the projects present on the portal and find a project related to Neuroblastoma  
+```{r}
+#get the list of projects from TCGA
+GDC_project <-getGDCprojects()
+```
+
+Looking at the projects I could find project named TARGET-NBL for neuroblastoma.  
+
+```{r}
+clinical_data <- GDCquery_clinic("TARGET-NBL")
+```
+
+checking if we have columns of interest in the clinical data 
+```{r}
+any(colnames(clinical_data) %in% c("vital_status","days_to_last_follow_up","days_to_death"))
+```
+Since we have these columns lets get their column number
+```{r}
+which(colnames(clinical_data)%in% c("vital_status","days_to_last_follow_up","days_to_death"))
+```
+Now that we have the column numbers lets extract these columns
+```{r}
+selected_columns <- clinical_data[,c(25,35,41)]
+head(selected_columns)
+```
+
+Getting the number of alive and dead pateints in the cohort
+```{r}
+table(selected_columns$vital_status)
+```
+*Creating Status information for Censoring*
+
+For patients that are have died we will set the value as True 
+while for the patients that are alive or unknown we will set the value to False 
+
+```{r}
+clinical_data$censored <- ifelse(clinical_data$vital_status== 'Dead', TRUE, FALSE)
+
+table(clinical_data$censored)
+```
+*Time information*
+
+Days to death: Number of days passed from initial diagnosis to patients death 
+Days to last follow up: Number of days from initial diagnosis to the last visit 
+
+Patients that are alive would be assigned days to last follow up days 
+Patients that are dead will be assigned days to death 
+
+```{r}
+clinical_data$overall_survival <- ifelse(clinical_data$vital_status=="Dead",clinical_data$days_to_death,clinical_data$days_to_last_follow_up)
+```
+
+We need to download the gene expression data as the question I am trying to ask here is that how MYCN expression affects survival 
+
+#Downloading expression data from TCGA portal 
+visit the following link for help page of TCGAbiolinks: https://bioconductor.org/packages/release/bioc/vignettes/TCGAbiolinks/inst/doc/query.html 
+
+```{r}
+query_NB <- GDCquery(project = "TARGET-NBL",
+                     data.category = "Transcriptome Profiling", experimental.strategy = "RNA-Seq", workflow.type = "STAR - Counts", data.type = "Gene Expression Quantification",
+                     sample.type = "Primary Tumor", access = "open")
+
+output_NB <- getResults(query_NB)
+head(output_NB)
+```
+
+Subsetting information for only 20 NB cases 
+
+```{r}
+Neuroblastoma <- output_NB$cases[1:10]
+```
+
+Getting expression for just these 10 cases for this tute
+
+```{r}
+query_NB <- GDCquery(project = "TARGET-NBL",
+                     data.category = "Transcriptome Profiling", experimental.strategy = "RNA-Seq", workflow.type = "STAR - Counts", data.type = "Gene Expression Quantification",
+                     sample.type = "Primary Tumor", access = "open",
+                     barcode = Neuroblastoma)
+
+GDCdownload(query_NB, directory = "C:/Users/notay003/Downloads/")
+```
+
+Getting normlaised counts
+```{r}
+tcga_NB <- GDCprepare(query_NB, summarizedExperiment = T, directory = "C:/Users/notay003/Downloads/")
+tcga_mat <- assay(tcga_NB, 'unstranded')
+```
+
+```{r}
+tcga_mat[1:3,1:3]
+```
+Extarcting gene and sample metadata from the summarized experiment 
+
+```{r}
+gene_metadata <- as.data.frame(rowData(tcga_NB))
+gene_metadata[1:5]
+coldata <- as.data.frame(colData(tcga_NB))
+coldata
+```
+
+To set a threshold expression value above which we'll consider high expression of MYCN or any other gene of interest we'll vst transform counts to be used in survival analysis so as to define a cutoff for gene of interest 
+
+```{r}
+dds <- DESeqDataSetFromMatrix(countData = tcga_mat,
+                              colData = coldata,
+                              design = ~ 1)
+```
+
+Removing genes with <10 reads across all samples
+
+```{r}
+keep <- rowSums(counts(dds)) >=10
+dds <- dds[keep,]
+```
+
+vst-variance stabilized transformation 
+```{r}
+vsd <- vst(dds,blind = F)
+NB_mat_vst <- assay(vsd)
+NB_mat_vst[1:2,1:2]
+```
+Adding Gene symbols for these corresponding gene ids 
+```{r}
+NB_MYCN <- NB_mat_vst %>% as.data.frame()%>% rownames_to_column("gene_id")%>%gather(key = 'case', value='counts', -gene_id) %>% left_join(.,gene_metadata, by='gene_id') %>% filter(gene_name == "MYCN") 
+```
+
+To determine the expression level as high or low you may either consider taking the 
+(i) Median value
+(ii)Percentiles 
+(iii)Using custom values on biological information
+(iv)Statistical test e.g. T-test, Man Whitney U test to determine the p-values
+
+I will be using the median value to charecterise between low and high expressing groups
+```{r}
+median_val <- median(NB_MYCN$counts)
+NB_MYCN$exprs <- ifelse(NB_MYCN$counts >= median_val, "High","Low")
+```
+
+Adding clinical information to MYCN
+
+```{r}
+NB_MYCN$case_id <- gsub("-01.*","",NB_MYCN$case)
+NB_MYCN <- merge(NB_MYCN, clinical_data_u, by.x="case_id", by.y= "submitter_id")
+
+NB_MYCN
+```
+
+Fitting survival curve 
+
+```{r}
+fit <- survfit(Surv(overall_survival,censored) ~ exprs,data=NB_MYCN)
+fit
+```
+```{r,echo=T}
+ggsurvplot(fit,NB_MYCN,pval = T,risk.table = T)
+```
+
+on X axis we have time in days 
+Y axis has survival probability 
+
+The risk(strata) table shows the number of absolute patients at risk at each time 
+
+
+```{r}
+fit_2 <-survdiff(Surv(overall_survival,censored) ~ exprs, data = NB_MYCN)
+fit_2
+```
+Since we are interested in looking at the difference between the two groups (high and low MYCN)
+
+expected events if there was no difference bw the two groups the last two columns give info on contribution of each group to chisq stats and the variance of contribution on chi sq stats
+*****************************************************
+
+
+survdiff- survival properties based on categorical variable 
+If we just want to estimate the survival probabilities to generate kaplan meier curve use survfit()
+
+For cox regression check this out
+http://www.sthda.com/english/wiki/cox-proportional-hazards-model 
+
